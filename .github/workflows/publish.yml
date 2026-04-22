@@ -46,7 +46,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install build deps
-        run: uv pip install build
+        run: uv pip install --system build
 
       - name: Extract tag name
         id: tag
