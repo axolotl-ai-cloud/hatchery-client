@@ -86,7 +86,9 @@ class _BackgroundLoop:
 
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run, name="hatchery-client-loop", daemon=True)
+        self.thread = threading.Thread(
+            target=self._run, name="hatchery-client-loop", daemon=True
+        )
         self.thread.start()
 
     def _run(self) -> None:
@@ -377,7 +379,9 @@ class HatcheryClient:
         # don't need to retrieve the future for this op.
         model_id = model_resp.get("model_id")
         if not model_id:
-            raise HatcheryClientError(f"create_model: missing model_id in response: {model_resp}")
+            raise HatcheryClientError(
+                f"create_model: missing model_id in response: {model_resp}"
+            )
         return TrainingClient(self, model_id, base_model, rank)
 
     def create_lora_training_client(
@@ -403,11 +407,81 @@ class HatcheryClient:
             )
         )
 
-    async def create_full_param_training_client_async(self, base_model: str) -> TrainingClient:
+    async def create_full_param_training_client_async(
+        self, base_model: str
+    ) -> TrainingClient:
         return await self.create_lora_training_client_async(base_model, rank=None)
 
     def create_full_param_training_client(self, base_model: str) -> TrainingClient:
         return _bg_sync(self.create_full_param_training_client_async(base_model))
+
+    async def create_sampling_client_async(
+        self,
+        *,
+        base_model: Optional[str] = None,
+        model_path: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> "SamplingClient":
+        """Create a :class:`SamplingClient` for inference.
+
+        Matches the official tinker ``ServiceClient.create_sampling_client``
+        signature. Pass ``base_model`` to point at a raw HF id (or local
+        FS path), or ``model_path`` to load from a saved checkpoint URI
+        (``tinker://{parent_model_id}/checkpoints/{name}`` or
+        ``.../sampler_weights/{name}``). At least one is required; when
+        both are set, ``model_path`` wins and the effective base is
+        derived from the parent session's record.
+
+        Returns a fully-initialized :class:`SamplingClient` — the
+        underlying session is created + warmed on the worker before this
+        call returns.
+        """
+        if base_model is None and model_path is None:
+            raise ValueError("Either model_path or base_model must be provided")
+        body: dict[str, Any] = {}
+        if base_model is not None:
+            body["base_model"] = base_model
+        if model_path is not None:
+            body["model_path"] = model_path
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
+        resp = await self._post("/api/v1/create_sampling_session", body)
+        future_id = resp.get("request_id") or resp.get("future_id")
+        if future_id is None:
+            raise HatcheryClientError(
+                f"create_sampling_session: missing request_id/future_id: {resp}"
+            )
+        # The route registers the inline result synchronously; resolving
+        # the future yields the {sampling_session_id, model_id, ...}
+        # envelope without any additional worker round-trip.
+        fut = _HatcheryFuture(self, future_id, "create_sampling_session")
+        inline = await fut.result_async()
+        sampling_session_id = inline.get("sampling_session_id")
+        model_id = inline.get("model_id") or resp.get("model_id")
+        if not sampling_session_id or not model_id:
+            raise HatcheryClientError(
+                f"create_sampling_session: incomplete inline response: {inline}"
+            )
+        return SamplingClient(
+            client=self,
+            model_id=model_id,
+            sampling_session_id=sampling_session_id,
+        )
+
+    def create_sampling_client(
+        self,
+        *,
+        base_model: Optional[str] = None,
+        model_path: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> "SamplingClient":
+        return _bg_sync(
+            self.create_sampling_client_async(
+                base_model=base_model,
+                model_path=model_path,
+                ttl_seconds=ttl_seconds,
+            )
+        )
 
     async def list_sessions_async(self) -> list[dict]:
         """List active sessions.
@@ -510,6 +584,57 @@ class TrainingClient:
         loss_fn_config: Optional[dict] = None,
     ) -> _HatcheryFuture:
         return _bg_sync(self.forward_only_async(data, loss_fn, loss_fn_config))
+
+    async def forward_async(
+        self,
+        data: list,
+        loss_fn: str = "cross_entropy",
+        loss_fn_config: Optional[dict] = None,
+    ) -> _HatcheryFuture:
+        """No-grad forward returning per-position logprobs at target_tokens.
+
+        Matches the official tinker ``TrainingClient.forward`` — distinct
+        from Hatchery's pre-existing :meth:`forward_only`, which returns a
+        scalar loss only. Posts to ``/api/v1/forward`` (the route the
+        Tinker SDK uses internally for ``forward_backward_custom`` step 1).
+
+        The future's ``.result()`` matches tinker's ``ForwardBackwardOutput``::
+
+            {
+              "loss_fn_output_type": "cross_entropy",
+              "loss_fn_outputs": [
+                {"logprobs": {"data": [...], "dtype": "float32", "shape": [N]}},
+                ...
+              ],
+              "metrics": {...},
+            }
+
+        where each entry in ``loss_fn_outputs`` carries the per-position
+        logprobs for one datum, with position 0 = 0.0 per the Tinker
+        convention (the gateway's wrapping is in
+        ``hatchery.core.tinker_compat._wrap_future_result``). Slice/mask
+        the response positions client-side.
+        """
+        normalized = [d.model_dump() if hasattr(d, "model_dump") else d for d in data]
+        body: dict[str, Any] = {
+            "model_id": self.model_id,
+            "seq_id": self._next_seq(),
+            "forward_input": {
+                "data": normalized,
+                "loss_fn": loss_fn,
+            },
+        }
+        if loss_fn_config is not None:
+            body["forward_input"]["loss_fn_config"] = loss_fn_config
+        return await self._submit("/api/v1/forward", body, "forward")
+
+    def forward(
+        self,
+        data: list[dict],
+        loss_fn: str = "cross_entropy",
+        loss_fn_config: Optional[dict] = None,
+    ) -> _HatcheryFuture:
+        return _bg_sync(self.forward_async(data, loss_fn, loss_fn_config))
 
     async def optim_step_async(
         self,
@@ -630,7 +755,9 @@ class TrainingClient:
     def save_state(self, name: str) -> _HatcheryFuture:
         return _bg_sync(self.save_state_async(name))
 
-    async def load_weights_async(self, path: str, *, optimizer: bool = False) -> _HatcheryFuture:
+    async def load_weights_async(
+        self, path: str, *, optimizer: bool = False
+    ) -> _HatcheryFuture:
         body = {
             "model_id": self.model_id,
             "path": path,
@@ -643,13 +770,17 @@ class TrainingClient:
         return _bg_sync(self.load_weights_async(path, optimizer=optimizer))
 
     async def list_checkpoints_async(self) -> list[str]:
-        r = await self._client._get(f"/api/v1/training_runs/{self.model_id}/checkpoints")
+        r = await self._client._get(
+            f"/api/v1/training_runs/{self.model_id}/checkpoints"
+        )
         return [c["checkpoint_id"] for c in r.get("checkpoints", [])]
 
     def list_checkpoints(self) -> list[str]:
         return _bg_sync(self.list_checkpoints_async())
 
-    def save_weights_and_get_sampling_client(self, name: Optional[str] = None) -> SamplingClient:
+    def save_weights_and_get_sampling_client(
+        self, name: Optional[str] = None
+    ) -> SamplingClient:
         """Save current weights and return a SamplingClient for inference.
 
         Matches the official Tinker SDK's
@@ -659,7 +790,9 @@ class TrainingClient:
         result = fut.result(timeout=60)
         sampling_session_id = result.get("sampling_session_id")
         if not sampling_session_id:
-            sampling_session_id = result.get("path", "").replace("tinker://", "").split("/")[0]
+            sampling_session_id = (
+                result.get("path", "").replace("tinker://", "").split("/")[0]
+            )
         return SamplingClient(
             client=self._client,
             model_id=self.model_id,
@@ -726,3 +859,55 @@ class SamplingClient:
 
     def sample(self, prompt_tokens: list[int], **kwargs: Any) -> _HatcheryFuture:
         return _bg_sync(self.sample_async(prompt_tokens, **kwargs))
+
+    async def compute_logprobs_async(
+        self, prompt_tokens: list[int]
+    ) -> list[Optional[float]]:
+        """Per-token logprobs over the prompt, matching tinker
+        ``SamplingClient.compute_logprobs``.
+
+        Implementation mirrors the upstream SDK's own strategy
+        (``sampling_client.py:399-406`` in ``tinker==0.22.2``): issue a
+        degenerate ``/asample`` call with ``max_tokens=1`` and
+        ``prompt_logprobs=True``, then return the response's
+        ``prompt_logprobs`` field. The single sampled token is discarded.
+
+        Returns a list of length ``len(prompt_tokens)`` where position 0
+        is ``None`` (causal logprob undefined for the first token) and
+        subsequent positions are floats.
+        """
+        body: dict[str, Any] = {
+            "sampling_session_id": self.sampling_session_id,
+            "seq_id": self._next_seq(),
+            "prompt": {
+                "chunks": [{"type": "encoded_text", "tokens": list(prompt_tokens)}],
+            },
+            "num_samples": 1,
+            "sampling_params": {
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "seed": None,
+                "stop": [],
+            },
+            "prompt_logprobs": True,
+        }
+        resp = await self._client._post("/api/v1/asample", body)
+        future_id = resp.get("future_id") or resp.get("request_id")
+        fut = _HatcheryFuture(self._client, future_id, "compute_logprobs")
+        result = await fut.result_async()
+        return list(result.get("prompt_logprobs", []))
+
+    def compute_logprobs(self, prompt_tokens: list[int]) -> list[Optional[float]]:
+        """Synchronous facade for :meth:`compute_logprobs_async`.
+
+        Returns the per-token logprobs list directly (blocks until the
+        sample completes). Deliberately diverges from tinker's
+        ``SamplingClient.compute_logprobs`` which returns a
+        ``ConcurrentFuture`` — Hatchery's sync facade mirrors
+        :meth:`HatcheryClient.list_sessions`, which also returns the
+        final value rather than a future. Use the ``_async`` variant
+        with ``asyncio.gather`` for concurrent calls.
+        """
+        return _bg_sync(self.compute_logprobs_async(prompt_tokens))
