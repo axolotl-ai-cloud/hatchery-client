@@ -18,6 +18,7 @@ dependencies = [
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "respx>=0.21",
 ]
 
 [tool.setuptools.dynamic]
@@ -25,3 +26,6 @@ version = {file = "VERSION"}
 
 [tool.setuptools.packages.find]
 include = ["hatchery*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
